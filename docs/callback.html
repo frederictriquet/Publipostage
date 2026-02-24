@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<title>Publipostage - TikTok Auth</title>
+<style>
+  body { font-family: monospace; max-width: 600px; margin: 40px auto; padding: 20px; }
+  code { background: #f0f0f0; padding: 8px 16px; font-size: 1.2em; display: block; margin: 16px 0; word-break: break-all; }
+</style>
+<script>
+  const params = new URLSearchParams(window.location.search);
+  const authCode = params.get("code");
+  const error = params.get("error");
+  window.onload = function() {
+    if (authCode) {
+      document.getElementById("result").innerHTML =
+        "<h1>Autorisation OK</h1>" +
+        "<p>Copie ce code et colle-le dans le terminal :</p>" +
+        "<code>" + authCode + "</code>";
+    } else {
+      document.getElementById("result").innerHTML =
+        "<h1>Erreur</h1><p>" + (error || "Pas de code recu") + "</p>";
+    }
+  };
+</script>
+</head>
+<body>
+<div id="result"><p>Chargement...</p></div>
+</body>
+</html>
