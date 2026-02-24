@@ -3,13 +3,24 @@
 
 import argparse
 import os
+import shutil
 import sys
 import time
+import tomllib
 
 import requests
 
 API_BASE = "https://graph.instagram.com/v25.0"
 TEMP_HOST = "https://tmpfiles.org/api/v1/upload"
+CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.toml")
+
+
+def load_config():
+    """Charge la configuration depuis config.toml."""
+    if not os.path.isfile(CONFIG_PATH):
+        return {}
+    with open(CONFIG_PATH, "rb") as f:
+        return tomllib.load(f)
 
 
 def read_caption(path):
@@ -118,12 +129,61 @@ def publish_media(account_id, container_id, token):
     return resp.json()
 
 
+def resolve_path(path, media_dir):
+    """Résout un chemin : absolu tel quel, relatif cherché dans media_dir puis cwd."""
+    if os.path.isabs(path):
+        return path
+    if media_dir:
+        candidate = os.path.join(media_dir, path)
+        if os.path.exists(candidate):
+            return candidate
+    return path
+
+
+def list_available_media(media_dir):
+    """Liste les médias publiables (paires .mp4 + .txt) dans media_dir."""
+    if not os.path.isdir(media_dir):
+        print(f"Erreur : répertoire introuvable : {media_dir}", file=sys.stderr)
+        sys.exit(1)
+
+    videos = {os.path.splitext(f)[0] for f in os.listdir(media_dir) if f.endswith(".mp4")}
+    texts = {os.path.splitext(f)[0] for f in os.listdir(media_dir) if f.endswith(".txt")}
+    available = sorted(videos & texts)
+
+    if not available:
+        print(f"Aucun média publiable dans {media_dir}", file=sys.stderr)
+        print("(il faut un .mp4 ET un .txt avec le même nom)", file=sys.stderr)
+        sys.exit(1)
+
+    return available
+
+
+def prompt_media_choice(available):
+    """Affiche la liste et demande à l'utilisateur de choisir."""
+    print("Médias disponibles :\n")
+    for i, name in enumerate(available, 1):
+        print(f"  {i}. {name}")
+    print()
+
+    while True:
+        try:
+            choice = input("Choix (numéro) : ").strip()
+            idx = int(choice) - 1
+            if 0 <= idx < len(available):
+                return available[idx]
+        except (ValueError, EOFError):
+            pass
+        print(f"Choix invalide, entre 1 et {len(available)}")
+
+
 def main():
+    config = load_config()
+    defaults = config.get("defaults", {})
+    media_dir = defaults.get("media_dir")
+
     parser = argparse.ArgumentParser(description="Publie une vidéo sur Instagram")
-    parser.add_argument("--video", required=True, help="Chemin vers le fichier vidéo")
-    parser.add_argument(
-        "--texte", required=True, help="Chemin vers le fichier texte (caption)"
-    )
+    parser.add_argument("--video", help="Chemin vers le fichier vidéo")
+    parser.add_argument("--texte", help="Chemin vers le fichier texte (caption)")
 
     thumb = parser.add_mutually_exclusive_group()
     thumb.add_argument(
@@ -131,10 +191,31 @@ def main():
     )
     thumb.add_argument(
         "--thumbnail-at",
+        default=defaults.get("thumbnail_at"),
         help="Timestamp pour la couverture (ex: 5, 0:05, 00:00:05)",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Simule la publication sans poster sur Instagram",
     )
 
     args = parser.parse_args()
+
+    # Mode interactif si --video et --texte ne sont pas fournis
+    if not args.video and not args.texte:
+        if not media_dir:
+            parser.error("--video et --texte requis (ou configurer media_dir dans config.toml)")
+        chosen = prompt_media_choice(list_available_media(media_dir))
+        args.video = os.path.join(media_dir, f"{chosen}.mp4")
+        args.texte = os.path.join(media_dir, f"{chosen}.txt")
+    elif not args.video or not args.texte:
+        parser.error("--video et --texte doivent être fournis ensemble")
+
+    # Résolution des chemins via media_dir
+    args.video = resolve_path(args.video, media_dir)
+    args.texte = resolve_path(args.texte, media_dir)
+    if args.thumbnail and not args.thumbnail.startswith(("http://", "https://")):
+        args.thumbnail = resolve_path(args.thumbnail, media_dir)
 
     # Validation des fichiers
     if not os.path.isfile(args.video):
@@ -142,10 +223,10 @@ def main():
     if not os.path.isfile(args.texte):
         parser.error(f"Fichier texte introuvable : {args.texte}")
 
-    # Credentials
+    # Credentials (pas requis en dry-run)
     account_id = os.environ.get("INSTAGRAM_ACCOUNT_ID")
     token = os.environ.get("INSTAGRAM_ACCESS_TOKEN")
-    if not account_id or not token:
+    if not args.dry_run and (not account_id or not token):
         print(
             "Erreur : INSTAGRAM_ACCOUNT_ID et INSTAGRAM_ACCESS_TOKEN requis",
             file=sys.stderr,
@@ -172,6 +253,18 @@ def main():
             cover_url = upload_temp(args.thumbnail)
             print(f"  OK : {cover_url}")
 
+    if args.dry_run:
+        size_mb = os.path.getsize(args.video) / (1024 * 1024)
+        print(f"\n[DRY RUN] Résumé :")
+        print(f"  Vidéo    : {args.video} ({size_mb:.1f} Mo)")
+        print(f"  Caption  : {caption[:80]}{'...' if len(caption) > 80 else ''}")
+        if thumb_offset is not None:
+            print(f"  Thumbnail: frame à {thumb_offset}ms")
+        elif cover_url:
+            print(f"  Thumbnail: {cover_url}")
+        print(f"\nAucune publication effectuée.")
+        return
+
     # Upload vidéo sur hébergement temporaire
     size_mb = os.path.getsize(args.video) / (1024 * 1024)
     print(f"Upload de la vidéo ({size_mb:.1f} Mo)...")
@@ -195,6 +288,15 @@ def main():
     print("Publication...")
     result = publish_media(account_id, container_id, token)
     print(f"Publié ! ID : {result.get('id')}")
+
+    # Déplacement vers le répertoire Published
+    published_dir = defaults.get("published_dir")
+    if published_dir:
+        os.makedirs(published_dir, exist_ok=True)
+        for path in (args.video, args.texte):
+            dest = os.path.join(published_dir, os.path.basename(path))
+            shutil.move(path, dest)
+            print(f"  Déplacé : {os.path.basename(path)} -> Published/")
 
 
 if __name__ == "__main__":

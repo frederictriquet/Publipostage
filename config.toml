@@ -1,0 +1,4 @@
+[defaults]
+thumbnail_at = "2"
+media_dir = "/Users/fred/Movies/Jukebox"
+published_dir = "/Users/fred/Movies/Jukebox/Published"
