@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Publipostage - Publie des vidéos sur Instagram depuis la ligne de commande."""
+"""Publipostage - Publie des vidéos sur Instagram et TikTok depuis la ligne de commande."""
 
 import argparse
 import os
@@ -10,7 +10,8 @@ import tomllib
 
 import requests
 
-API_BASE = "https://graph.instagram.com/v25.0"
+INSTAGRAM_API = "https://graph.instagram.com/v25.0"
+TIKTOK_API = "https://open.tiktokapis.com/v2"
 TEMP_HOST = "https://tmpfiles.org/api/v1/upload"
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.toml")
 
@@ -69,7 +70,10 @@ def upload_temp(file_path):
     return url.replace("tmpfiles.org/", "tmpfiles.org/dl/")
 
 
-def create_container(account_id, token, video_url, caption, thumb_offset=None, cover_url=None):
+# --- Instagram ---
+
+
+def ig_create_container(account_id, token, video_url, caption, thumb_offset=None, cover_url=None):
     """Crée un container média Instagram."""
     data = {
         "media_type": "REELS",
@@ -82,19 +86,19 @@ def create_container(account_id, token, video_url, caption, thumb_offset=None, c
     if cover_url:
         data["cover_url"] = cover_url
 
-    resp = requests.post(f"{API_BASE}/{account_id}/media", data=data, timeout=30)
+    resp = requests.post(f"{INSTAGRAM_API}/{account_id}/media", data=data, timeout=30)
     if not resp.ok:
-        print(f"Erreur API : {resp.status_code} {resp.text}", file=sys.stderr)
+        print(f"  Erreur API Instagram : {resp.status_code} {resp.text}", file=sys.stderr)
         resp.raise_for_status()
     return resp.json()["id"]
 
 
-def wait_for_ready(container_id, token, timeout=300, interval=5):
-    """Attend que le container soit prêt pour la publication."""
+def ig_wait_for_ready(container_id, token, timeout=300, interval=5):
+    """Attend que le container Instagram soit prêt."""
     elapsed = 0
     while elapsed < timeout:
         resp = requests.get(
-            f"{API_BASE}/{container_id}",
+            f"{INSTAGRAM_API}/{container_id}",
             params={"fields": "status_code,status", "access_token": token},
             timeout=30,
         )
@@ -105,28 +109,158 @@ def wait_for_ready(container_id, token, timeout=300, interval=5):
         if status == "FINISHED":
             return True
         if status == "ERROR":
-            print(f"Erreur de traitement : {data.get('status')}", file=sys.stderr)
+            print(f"  Erreur Instagram : {data.get('status')}", file=sys.stderr)
             return False
 
-        print(f"  Traitement en cours ({status})...")
+        print(f"  Instagram : {status}...")
         time.sleep(interval)
         elapsed += interval
 
-    print("Timeout : traitement trop long", file=sys.stderr)
+    print("  Instagram : timeout", file=sys.stderr)
     return False
 
 
-def publish_media(account_id, container_id, token):
-    """Publie le média traité."""
+def ig_publish(account_id, container_id, token):
+    """Publie le média sur Instagram."""
     resp = requests.post(
-        f"{API_BASE}/{account_id}/media_publish",
+        f"{INSTAGRAM_API}/{account_id}/media_publish",
         data={"creation_id": container_id, "access_token": token},
         timeout=30,
     )
     if not resp.ok:
-        print(f"Erreur API : {resp.status_code} {resp.text}", file=sys.stderr)
+        print(f"  Erreur API Instagram : {resp.status_code} {resp.text}", file=sys.stderr)
         resp.raise_for_status()
     return resp.json()
+
+
+def publish_instagram(account_id, token, video_url, caption, thumb_offset=None, cover_url=None):
+    """Flux complet de publication Instagram."""
+    print("\n[Instagram]")
+    print("  Création du container...")
+    container_id = ig_create_container(
+        account_id, token, video_url, caption,
+        thumb_offset=thumb_offset, cover_url=cover_url,
+    )
+
+    print("  Traitement...")
+    if not ig_wait_for_ready(container_id, token):
+        return False
+
+    print("  Publication...")
+    result = ig_publish(account_id, container_id, token)
+    print(f"  OK ! ID : {result.get('id')}")
+    return True
+
+
+# --- TikTok ---
+
+
+def tt_init_upload(token, caption, video_size, thumb_offset=None):
+    """Initialise l'upload vidéo sur TikTok."""
+    post_info = {
+        "title": caption,
+        "privacy_level": "SELF_ONLY",
+    }
+    if thumb_offset is not None:
+        post_info["video_cover_timestamp_ms"] = thumb_offset
+
+    data = {
+        "post_info": post_info,
+        "source_info": {
+            "source": "FILE_UPLOAD",
+            "video_size": video_size,
+            "chunk_size": video_size,
+            "total_chunk_count": 1,
+        },
+    }
+
+    resp = requests.post(
+        f"{TIKTOK_API}/post/publish/video/init/",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        json=data,
+        timeout=30,
+    )
+    if not resp.ok:
+        print(f"  Erreur API TikTok : {resp.status_code} {resp.text}", file=sys.stderr)
+        resp.raise_for_status()
+    result = resp.json()
+    error = result.get("error", {})
+    if error.get("code") != "ok":
+        raise RuntimeError(f"TikTok : {error.get('code')} - {error.get('message')}")
+    return result["data"]["publish_id"], result["data"]["upload_url"]
+
+
+def tt_upload_video(upload_url, video_path, video_size):
+    """Upload la vidéo sur TikTok."""
+    with open(video_path, "rb") as f:
+        resp = requests.put(
+            upload_url,
+            headers={
+                "Content-Range": f"bytes 0-{video_size - 1}/{video_size}",
+                "Content-Type": "video/mp4",
+            },
+            data=f,
+            timeout=600,
+        )
+    resp.raise_for_status()
+
+
+def tt_wait_for_publish(token, publish_id, timeout=300, interval=5):
+    """Attend que la vidéo TikTok soit publiée."""
+    elapsed = 0
+    while elapsed < timeout:
+        resp = requests.post(
+            f"{TIKTOK_API}/post/publish/status/fetch/",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            json={"publish_id": publish_id},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        status = data.get("data", {}).get("status")
+
+        if status == "PUBLISH_COMPLETE":
+            return True
+        if status == "FAILED":
+            fail = data.get("data", {}).get("fail_reason", "inconnu")
+            print(f"  Erreur TikTok : {fail}", file=sys.stderr)
+            return False
+
+        print(f"  TikTok : {status}...")
+        time.sleep(interval)
+        elapsed += interval
+
+    print("  TikTok : timeout", file=sys.stderr)
+    return False
+
+
+def publish_tiktok(token, video_path, caption, thumb_offset=None):
+    """Flux complet de publication TikTok."""
+    print("\n[TikTok]")
+    video_size = os.path.getsize(video_path)
+
+    print("  Initialisation...")
+    publish_id, upload_url = tt_init_upload(token, caption, video_size, thumb_offset)
+
+    size_mb = video_size / (1024 * 1024)
+    print(f"  Upload ({size_mb:.1f} Mo)...")
+    tt_upload_video(upload_url, video_path, video_size)
+
+    print("  Traitement...")
+    if not tt_wait_for_publish(token, publish_id):
+        return False
+
+    print(f"  OK ! Publish ID : {publish_id}")
+    return True
+
+
+# --- Commun ---
 
 
 def resolve_path(path, media_dir):
@@ -181,7 +315,9 @@ def main():
     defaults = config.get("defaults", {})
     media_dir = defaults.get("media_dir")
 
-    parser = argparse.ArgumentParser(description="Publie une vidéo sur Instagram")
+    parser = argparse.ArgumentParser(
+        description="Publie une vidéo sur Instagram et/ou TikTok"
+    )
     parser.add_argument("--video", help="Chemin vers le fichier vidéo")
     parser.add_argument("--texte", help="Chemin vers le fichier texte (caption)")
 
@@ -195,8 +331,12 @@ def main():
         help="Timestamp pour la couverture (ex: 5, 0:05, 00:00:05)",
     )
     parser.add_argument(
+        "--platform", choices=["ig", "tt", "all"], default="all",
+        help="Plateforme cible : ig (Instagram), tt (TikTok), all (les deux)",
+    )
+    parser.add_argument(
         "--dry-run", action="store_true",
-        help="Simule la publication sans poster sur Instagram",
+        help="Simule la publication sans poster",
     )
 
     args = parser.parse_args()
@@ -223,17 +363,26 @@ def main():
     if not os.path.isfile(args.texte):
         parser.error(f"Fichier texte introuvable : {args.texte}")
 
-    # Credentials (pas requis en dry-run)
-    account_id = os.environ.get("INSTAGRAM_ACCOUNT_ID")
-    token = os.environ.get("INSTAGRAM_ACCESS_TOKEN")
-    if not args.dry_run and (not account_id or not token):
-        print(
-            "Erreur : INSTAGRAM_ACCOUNT_ID et INSTAGRAM_ACCESS_TOKEN requis",
-            file=sys.stderr,
-        )
+    # Plateformes disponibles
+    ig_account_id = os.environ.get("INSTAGRAM_ACCOUNT_ID")
+    ig_token = os.environ.get("INSTAGRAM_ACCESS_TOKEN")
+    tt_token = os.environ.get("TIKTOK_ACCESS_TOKEN")
+
+    has_ig = bool(ig_account_id and ig_token) and args.platform in ("ig", "all")
+    has_tt = bool(tt_token) and args.platform in ("tt", "all")
+
+    if not args.dry_run and not has_ig and not has_tt:
+        print("Erreur : aucune plateforme configurée ou sélectionnée", file=sys.stderr)
         sys.exit(1)
 
+    platforms = []
+    if has_ig:
+        platforms.append("Instagram")
+    if has_tt:
+        platforms.append("TikTok")
+
     caption = read_caption(args.texte)
+    size_mb = os.path.getsize(args.video) / (1024 * 1024)
     print(f"Caption : {caption[:80]}{'...' if len(caption) > 80 else ''}")
 
     # Thumbnail
@@ -249,54 +398,69 @@ def main():
         else:
             if not os.path.isfile(args.thumbnail):
                 parser.error(f"Image introuvable : {args.thumbnail}")
-            print("Upload de l'image de couverture...")
-            cover_url = upload_temp(args.thumbnail)
-            print(f"  OK : {cover_url}")
+            if not args.dry_run:
+                print("Upload de l'image de couverture...")
+                cover_url = upload_temp(args.thumbnail)
+                print(f"  OK : {cover_url}")
 
     if args.dry_run:
-        size_mb = os.path.getsize(args.video) / (1024 * 1024)
         print(f"\n[DRY RUN] Résumé :")
-        print(f"  Vidéo    : {args.video} ({size_mb:.1f} Mo)")
-        print(f"  Caption  : {caption[:80]}{'...' if len(caption) > 80 else ''}")
+        print(f"  Vidéo      : {args.video} ({size_mb:.1f} Mo)")
+        print(f"  Caption    : {caption[:80]}{'...' if len(caption) > 80 else ''}")
         if thumb_offset is not None:
-            print(f"  Thumbnail: frame à {thumb_offset}ms")
+            print(f"  Thumbnail  : frame à {thumb_offset}ms")
         elif cover_url:
-            print(f"  Thumbnail: {cover_url}")
+            print(f"  Thumbnail  : {cover_url}")
+        print(f"  Plateformes: {', '.join(platforms) if platforms else 'aucune configurée'}")
         print(f"\nAucune publication effectuée.")
         return
 
-    # Upload vidéo sur hébergement temporaire
-    size_mb = os.path.getsize(args.video) / (1024 * 1024)
-    print(f"Upload de la vidéo ({size_mb:.1f} Mo)...")
-    video_url = upload_temp(args.video)
-    print(f"  OK : {video_url}")
-
-    # Création du container Instagram
-    print("Création du container Instagram...")
-    container_id = create_container(
-        account_id, token, video_url, caption,
-        thumb_offset=thumb_offset, cover_url=cover_url,
-    )
-    print(f"  Container : {container_id}")
-
-    # Attente du traitement
-    print("Traitement par Instagram...")
-    if not wait_for_ready(container_id, token):
-        sys.exit(1)
+    # Upload temporaire pour Instagram (TikTok upload directement)
+    video_url = None
+    if has_ig:
+        print(f"\nUpload temporaire de la vidéo ({size_mb:.1f} Mo)...")
+        video_url = upload_temp(args.video)
+        print(f"  OK : {video_url}")
 
     # Publication
-    print("Publication...")
-    result = publish_media(account_id, container_id, token)
-    print(f"Publié ! ID : {result.get('id')}")
+    results = {}
 
-    # Déplacement vers le répertoire Published
-    published_dir = defaults.get("published_dir")
-    if published_dir:
-        os.makedirs(published_dir, exist_ok=True)
-        for path in (args.video, args.texte):
-            dest = os.path.join(published_dir, os.path.basename(path))
-            shutil.move(path, dest)
-            print(f"  Déplacé : {os.path.basename(path)} -> Published/")
+    if has_ig:
+        try:
+            results["Instagram"] = publish_instagram(
+                ig_account_id, ig_token, video_url, caption,
+                thumb_offset=thumb_offset, cover_url=cover_url,
+            )
+        except Exception as e:
+            print(f"  Instagram ECHEC : {e}", file=sys.stderr)
+            results["Instagram"] = False
+
+    if has_tt:
+        try:
+            results["TikTok"] = publish_tiktok(
+                tt_token, args.video, caption, thumb_offset=thumb_offset,
+            )
+        except Exception as e:
+            print(f"  TikTok ECHEC : {e}", file=sys.stderr)
+            results["TikTok"] = False
+
+    # Résumé
+    print(f"\n--- Résumé ---")
+    for platform, success in results.items():
+        print(f"  {platform} : {'OK' if success else 'ECHEC'}")
+
+    # Déplacement seulement si au moins une publication a réussi
+    if any(results.values()):
+        published_dir = defaults.get("published_dir")
+        if published_dir:
+            os.makedirs(published_dir, exist_ok=True)
+            for path in (args.video, args.texte):
+                dest = os.path.join(published_dir, os.path.basename(path))
+                shutil.move(path, dest)
+                print(f"  Déplacé : {os.path.basename(path)} -> Published/")
+
+    if not all(results.values()):
+        sys.exit(1)
 
 
 if __name__ == "__main__":
