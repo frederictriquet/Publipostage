@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="fr">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <title>Publipostage - TikTok Auth</title>
@@ -14,17 +14,17 @@
   window.onload = function() {
     if (authCode) {
       document.getElementById("result").innerHTML =
-        "<h1>Autorisation OK</h1>" +
-        "<p>Copie ce code et colle-le dans le terminal :</p>" +
+        "<h1>Authorization successful</h1>" +
+        "<p>Copy this code and paste it in the terminal:</p>" +
         "<code>" + authCode + "</code>";
     } else {
       document.getElementById("result").innerHTML =
-        "<h1>Erreur</h1><p>" + (error || "Pas de code recu") + "</p>";
+        "<h1>Error</h1><p>" + (error || "No code received") + "</p>";
     }
   };
 </script>
 </head>
 <body>
-<div id="result"><p>Chargement...</p></div>
+<div id="result"><p>Loading...</p></div>
 </body>
 </html>
