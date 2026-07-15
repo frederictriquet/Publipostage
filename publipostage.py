@@ -3,6 +3,7 @@
 
 import argparse
 import os
+import random
 import shutil
 import sys
 import time
@@ -10,10 +11,15 @@ import tomllib
 
 import requests
 
+from instagram_auth import get_instagram_token
+
 INSTAGRAM_API = "https://graph.instagram.com/v25.0"
 TIKTOK_API = "https://open.tiktokapis.com/v2"
-TEMP_HOST = "https://tmpfiles.org/api/v1/upload"
+TEMP_HOST = "https://litterbox.catbox.moe/resources/internals/api.php"
+TEMP_HOST_RETENTION = "72h"
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.toml")
+YT_TOKEN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "youtube_token.json")
+YOUTUBE_SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
 
 
 def load_config():
@@ -28,6 +34,14 @@ def read_caption(path):
     """Lit le texte de caption depuis un fichier."""
     with open(path, encoding="utf-8") as f:
         return f.read().strip()
+
+
+def parse_yt_caption(caption_text):
+    """Extrait le titre (1ère ligne) et la description (reste) pour YouTube."""
+    lines = caption_text.split("\n", 1)
+    title = lines[0].strip()
+    description = lines[1].strip() if len(lines) > 1 else ""
+    return title, description
 
 
 def timestamp_to_ms(ts):
@@ -53,21 +67,26 @@ def timestamp_to_ms(ts):
 def upload_temp(file_path):
     """Upload un fichier sur un hébergement temporaire, retourne l'URL publique."""
     file_size = os.path.getsize(file_path) / (1024 * 1024)
-    if file_size > 512:
-        print(f"Erreur : fichier trop volumineux ({file_size:.0f} Mo, max 512 Mo)", file=sys.stderr)
+    if file_size > 200:
+        print(f"Erreur : fichier trop volumineux ({file_size:.0f} Mo, max 200 Mo)", file=sys.stderr)
         sys.exit(1)
 
     with open(file_path, "rb") as f:
         resp = requests.post(
             TEMP_HOST,
-            files={"file": (os.path.basename(file_path), f)},
+            data={"reqtype": "fileupload", "time": TEMP_HOST_RETENTION},
+            files={"fileToUpload": (os.path.basename(file_path), f)},
             timeout=600,
         )
     resp.raise_for_status()
-    data = resp.json()
-    # tmpfiles.org retourne une URL de page, il faut insérer /dl/ pour le lien direct
-    url = data["data"]["url"]
-    return url.replace("tmpfiles.org/", "tmpfiles.org/dl/")
+    # litterbox retourne directement l'URL brute dans le corps de la réponse
+    url = resp.text.strip()
+    if not url.startswith("http"):
+        raise RuntimeError(
+            f"Réponse inattendue de l'hébergeur (HTTP {resp.status_code}, "
+            f"{len(resp.content)} octets) : {url!r}"
+        )
+    return url
 
 
 # --- Instagram ---
@@ -260,6 +279,72 @@ def publish_tiktok(token, video_path, caption, thumb_offset=None):
     return True
 
 
+# --- YouTube ---
+
+
+def yt_get_credentials():
+    """Charge et rafraîchit les credentials YouTube depuis le token stocké."""
+    try:
+        from google.oauth2.credentials import Credentials
+        from google.auth.transport.requests import Request
+    except ImportError:
+        print("  Erreur : google-auth manquant. Lance : uv pip install -r requirements.txt", file=sys.stderr)
+        return None
+
+    if not os.path.isfile(YT_TOKEN_PATH):
+        return None
+
+    creds = Credentials.from_authorized_user_file(YT_TOKEN_PATH, YOUTUBE_SCOPES)
+    if creds and creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+        with open(YT_TOKEN_PATH, "w") as f:
+            f.write(creds.to_json())
+    return creds if creds and creds.valid else None
+
+
+def publish_youtube(video_path, title, description, privacy="private"):
+    """Flux complet de publication YouTube."""
+    try:
+        from googleapiclient.discovery import build
+        from googleapiclient.http import MediaFileUpload
+    except ImportError:
+        print("  Erreur : google-api-python-client manquant. Lance : uv pip install -r requirements.txt", file=sys.stderr)
+        return False
+
+    print("\n[YouTube]")
+    creds = yt_get_credentials()
+    if not creds:
+        print("  Erreur : pas de credentials YouTube. Lance : python youtube_auth.py", file=sys.stderr)
+        return False
+
+    youtube = build("youtube", "v3", credentials=creds)
+    body = {
+        "snippet": {
+            "title": title,
+            "description": description,
+            "categoryId": "10",  # Catégorie Musique
+        },
+        "status": {
+            "privacyStatus": privacy,
+        },
+    }
+
+    size_mb = os.path.getsize(video_path) / (1024 * 1024)
+    print(f"  Upload ({size_mb:.1f} Mo)...")
+    media = MediaFileUpload(video_path, mimetype="video/mp4", resumable=True)
+    request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
+
+    response = None
+    while response is None:
+        status, response = request.next_chunk()
+        if status:
+            print(f"  YouTube : {int(status.progress() * 100)}%...")
+
+    video_id = response.get("id")
+    print(f"  OK ! Video ID : {video_id}")
+    return True
+
+
 # --- Commun ---
 
 
@@ -297,17 +382,25 @@ def prompt_media_choice(available):
     print("Médias disponibles :\n")
     for i, name in enumerate(available, 1):
         print(f"  {i}. {name}")
-    print()
+    print("\n  0. Quitter\n")
 
     while True:
         try:
-            choice = input("Choix (numéro) : ").strip()
-            idx = int(choice) - 1
+            choice = input("Choix (numéro, ou Entrée pour un aléatoire) : ").strip()
+            if not choice:
+                name = random.choice(available)
+                print(f"Choix aléatoire : {name}")
+                return name
+            num = int(choice)
+            if num == 0:
+                print("Abandon, rien n'a été publié.")
+                sys.exit(0)
+            idx = num - 1
             if 0 <= idx < len(available):
                 return available[idx]
         except (ValueError, EOFError):
             pass
-        print(f"Choix invalide, entre 1 et {len(available)}")
+        print(f"Choix invalide, entre 0 et {len(available)}")
 
 
 def main():
@@ -331,8 +424,12 @@ def main():
         help="Timestamp pour la couverture (ex: 5, 0:05, 00:00:05)",
     )
     parser.add_argument(
-        "--platform", choices=["ig", "tt", "all"], default="all",
-        help="Plateforme cible : ig (Instagram), tt (TikTok), all (les deux)",
+        "--platform", choices=["ig", "tt", "yt", "all"], default="all",
+        help="Plateforme cible : ig (Instagram), tt (TikTok), yt (YouTube), all (toutes)",
+    )
+    parser.add_argument(
+        "--yt-privacy", choices=["private", "unlisted", "public"], default="private",
+        help="Visibilité YouTube (défaut : private)",
     )
     parser.add_argument(
         "--dry-run", action="store_true",
@@ -365,13 +462,14 @@ def main():
 
     # Plateformes disponibles
     ig_account_id = os.environ.get("INSTAGRAM_ACCOUNT_ID")
-    ig_token = os.environ.get("INSTAGRAM_ACCESS_TOKEN")
+    ig_token = get_instagram_token() if args.platform in ("ig", "all") else None
     tt_token = os.environ.get("TIKTOK_ACCESS_TOKEN")
 
     has_ig = bool(ig_account_id and ig_token) and args.platform in ("ig", "all")
     has_tt = bool(tt_token) and args.platform in ("tt", "all")
+    has_yt = os.path.isfile(YT_TOKEN_PATH) and args.platform in ("yt", "all")
 
-    if not args.dry_run and not has_ig and not has_tt:
+    if not args.dry_run and not has_ig and not has_tt and not has_yt:
         print("Erreur : aucune plateforme configurée ou sélectionnée", file=sys.stderr)
         sys.exit(1)
 
@@ -380,8 +478,11 @@ def main():
         platforms.append("Instagram")
     if has_tt:
         platforms.append("TikTok")
+    if has_yt:
+        platforms.append("YouTube")
 
     caption = read_caption(args.texte)
+    yt_title, yt_description = parse_yt_caption(caption)
     size_mb = os.path.getsize(args.video) / (1024 * 1024)
     print(f"Caption : {caption[:80]}{'...' if len(caption) > 80 else ''}")
 
@@ -411,6 +512,10 @@ def main():
             print(f"  Thumbnail  : frame à {thumb_offset}ms")
         elif cover_url:
             print(f"  Thumbnail  : {cover_url}")
+        if has_yt:
+            print(f"  YT Titre   : {yt_title}")
+            print(f"  YT Desc    : {yt_description[:60]}{'...' if len(yt_description) > 60 else ''}")
+            print(f"  YT Privacy : {args.yt_privacy}")
         print(f"  Plateformes: {', '.join(platforms) if platforms else 'aucune configurée'}")
         print(f"\nAucune publication effectuée.")
         return
@@ -443,6 +548,15 @@ def main():
         except Exception as e:
             print(f"  TikTok ECHEC : {e}", file=sys.stderr)
             results["TikTok"] = False
+
+    if has_yt:
+        try:
+            results["YouTube"] = publish_youtube(
+                args.video, yt_title, yt_description, privacy=args.yt_privacy,
+            )
+        except Exception as e:
+            print(f"  YouTube ECHEC : {e}", file=sys.stderr)
+            results["YouTube"] = False
 
     # Résumé
     print(f"\n--- Résumé ---")
