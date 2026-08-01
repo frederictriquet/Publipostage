@@ -15,8 +15,11 @@ from instagram_auth import get_instagram_token
 
 INSTAGRAM_API = "https://graph.instagram.com/v25.0"
 TIKTOK_API = "https://open.tiktokapis.com/v2"
-TEMP_HOST = "https://litterbox.catbox.moe/resources/internals/api.php"
+LITTERBOX_URL = "https://litterbox.catbox.moe/resources/internals/api.php"
+TMPFILES_URL = "https://tmpfiles.org/api/v1/upload"
 TEMP_HOST_RETENTION = "72h"
+# Taille maximale (Mo) : borne minimale commune aux hébergeurs supportés.
+TEMP_MAX_SIZE_MB = 200
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.toml")
 YT_TOKEN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "youtube_token.json")
 YOUTUBE_SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
@@ -64,22 +67,17 @@ def timestamp_to_ms(ts):
     return int(seconds * 1000)
 
 
-def upload_temp(file_path):
-    """Upload un fichier sur un hébergement temporaire, retourne l'URL publique."""
-    file_size = os.path.getsize(file_path) / (1024 * 1024)
-    if file_size > 200:
-        print(f"Erreur : fichier trop volumineux ({file_size:.0f} Mo, max 200 Mo)", file=sys.stderr)
-        sys.exit(1)
-
+def _upload_litterbox(file_path):
+    """Upload sur litterbox (catbox). Retourne l'URL brute du corps de la réponse."""
     with open(file_path, "rb") as f:
         resp = requests.post(
-            TEMP_HOST,
+            LITTERBOX_URL,
             data={"reqtype": "fileupload", "time": TEMP_HOST_RETENTION},
             files={"fileToUpload": (os.path.basename(file_path), f)},
             timeout=600,
         )
     resp.raise_for_status()
-    # litterbox retourne directement l'URL brute dans le corps de la réponse
+    # litterbox retourne directement l'URL brute dans le corps de la réponse.
     url = resp.text.strip()
     if not url.startswith("http"):
         raise RuntimeError(
@@ -87,6 +85,55 @@ def upload_temp(file_path):
             f"{len(resp.content)} octets) : {url!r}"
         )
     return url
+
+
+def _upload_tmpfiles(file_path):
+    """Upload sur tmpfiles.org. Retourne l'URL directe (via insertion de /dl/)."""
+    with open(file_path, "rb") as f:
+        resp = requests.post(
+            TMPFILES_URL,
+            files={"file": (os.path.basename(file_path), f)},
+            timeout=600,
+        )
+    resp.raise_for_status()
+    # tmpfiles.org retourne une URL de page ; on insère /dl/ pour le lien direct.
+    url = resp.json()["data"]["url"]
+    return url.replace("tmpfiles.org/", "tmpfiles.org/dl/")
+
+
+# Hébergeurs temporaires, essayés dans l'ordre (fallback si l'un est en panne).
+TEMP_HOSTS = [
+    ("litterbox", _upload_litterbox),
+    ("tmpfiles", _upload_tmpfiles),
+]
+
+
+def upload_temp(file_path):
+    """Upload un fichier sur un hébergement temporaire, retourne l'URL publique.
+
+    Essaie chaque hébergeur de TEMP_HOSTS à tour de rôle : si le premier échoue
+    (panne, timeout, réponse invalide), on bascule sur le suivant.
+    """
+    file_size = os.path.getsize(file_path) / (1024 * 1024)
+    if file_size > TEMP_MAX_SIZE_MB:
+        print(
+            f"Erreur : fichier trop volumineux ({file_size:.0f} Mo, "
+            f"max {TEMP_MAX_SIZE_MB} Mo)",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    errors = []
+    for name, uploader in TEMP_HOSTS:
+        try:
+            return uploader(file_path)
+        except Exception as exc:  # noqa: BLE001 - on veut basculer quel que soit l'échec
+            errors.append(f"{name} : {exc}")
+            print(f"  Hébergeur {name} indisponible ({exc})", file=sys.stderr)
+
+    raise RuntimeError(
+        "Tous les hébergeurs temporaires ont échoué :\n  - " + "\n  - ".join(errors)
+    )
 
 
 # --- Instagram ---
