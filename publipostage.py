@@ -91,6 +91,46 @@ def upload_temp(file_path):
 
 # --- Instagram ---
 
+IG_MAX_RETRIES = 3
+IG_RETRY_BACKOFF = [5, 15, 30]  # seconds between attempts
+
+
+def _ig_request(method, url, *, retry=True, **kwargs):
+    """Effectue une requête vers l'API Instagram avec retry sur les erreurs serveur.
+
+    Les 5xx (et erreurs réseau) sont réessayés avec backoff : un 500 corps vide de
+    graph.instagram.com est généralement un incident transitoire côté Meta.
+    Les 4xx (token, requête invalide) ne sont PAS réessayés — ils ne se résoudront pas seuls.
+    """
+    kwargs.setdefault("timeout", 30)
+    for attempt in range(IG_MAX_RETRIES):
+        last = attempt == IG_MAX_RETRIES - 1
+        try:
+            resp = requests.request(method, url, **kwargs)
+        except requests.RequestException as exc:
+            if not retry or last:
+                raise
+            reason = str(exc)
+        else:
+            if resp.ok:
+                return resp
+            # 4xx : erreur définitive, on ne réessaie pas.
+            if resp.status_code < 500 or not retry or last:
+                print(f"  Erreur API Instagram : {resp.status_code} {resp.text}", file=sys.stderr)
+                resp.raise_for_status()
+            reason = f"HTTP {resp.status_code}"
+
+        delay = IG_RETRY_BACKOFF[min(attempt, len(IG_RETRY_BACKOFF) - 1)]
+        print(
+            f"  Instagram : erreur serveur ({reason}), nouvelle tentative "
+            f"dans {delay}s ({attempt + 2}/{IG_MAX_RETRIES})...",
+            file=sys.stderr,
+        )
+        time.sleep(delay)
+
+    # Ne devrait jamais être atteint : la dernière itération lève toujours.
+    raise RuntimeError("Instagram : échec après plusieurs tentatives")
+
 
 def ig_create_container(account_id, token, video_url, caption, thumb_offset=None, cover_url=None):
     """Crée un container média Instagram."""
@@ -105,10 +145,7 @@ def ig_create_container(account_id, token, video_url, caption, thumb_offset=None
     if cover_url:
         data["cover_url"] = cover_url
 
-    resp = requests.post(f"{INSTAGRAM_API}/{account_id}/media", data=data, timeout=30)
-    if not resp.ok:
-        print(f"  Erreur API Instagram : {resp.status_code} {resp.text}", file=sys.stderr)
-        resp.raise_for_status()
+    resp = _ig_request("POST", f"{INSTAGRAM_API}/{account_id}/media", data=data)
     return resp.json()["id"]
 
 
@@ -116,12 +153,11 @@ def ig_wait_for_ready(container_id, token, timeout=300, interval=5):
     """Attend que le container Instagram soit prêt."""
     elapsed = 0
     while elapsed < timeout:
-        resp = requests.get(
+        resp = _ig_request(
+            "GET",
             f"{INSTAGRAM_API}/{container_id}",
             params={"fields": "status_code,status", "access_token": token},
-            timeout=30,
         )
-        resp.raise_for_status()
         data = resp.json()
         status = data.get("status_code")
 
@@ -141,14 +177,11 @@ def ig_wait_for_ready(container_id, token, timeout=300, interval=5):
 
 def ig_publish(account_id, container_id, token):
     """Publie le média sur Instagram."""
-    resp = requests.post(
+    resp = _ig_request(
+        "POST",
         f"{INSTAGRAM_API}/{account_id}/media_publish",
         data={"creation_id": container_id, "access_token": token},
-        timeout=30,
     )
-    if not resp.ok:
-        print(f"  Erreur API Instagram : {resp.status_code} {resp.text}", file=sys.stderr)
-        resp.raise_for_status()
     return resp.json()
 
 
