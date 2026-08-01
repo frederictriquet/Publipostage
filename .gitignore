@@ -3,3 +3,11 @@
 .envrc
 __pycache__
 *.pyc
+
+# Secrets / OAuth tokens
+instagram_token.json
+youtube_token.json
+*_token.json
+
+# Claude Code local state
+.claude/
